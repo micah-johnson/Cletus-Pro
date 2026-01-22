@@ -189,10 +189,9 @@ class LazyGraphSNN(nn.Module):
         Spikes propagate with delay: neuron fires at t → targets receive at t + spike_delay.
         Uses lazy decay: membrane only updated when input arrives.
 
-        Gradient flow:
-        - Input spikes -> input weights -> hidden potentials
-        - Hidden potentials -> surrogate spike -> hidden weights -> output potentials
-        - Output potentials -> loss
+        GRADIENT FIX: Instead of storing spike_strength (which breaks the graph),
+        we store pending spike tensors with their gradients intact in a dict keyed by
+        delivery time. This maintains gradient flow through multi-hop paths.
 
         Args:
             input_spikes: [num_input] boolean tensor
@@ -202,26 +201,30 @@ class LazyGraphSNN(nn.Module):
             output_spike_times: [num_output] first spike time per output (-1 if none)
             info: Dictionary with output_potentials for loss computation
         """
-        # Initialize timing wheel
+        # Initialize timing wheel (for scheduling only, not gradient)
         wheel = TimingWheel(num_slots=max(256, max_timesteps * 2), device=self.device)
 
         # State tensors
         potentials = torch.zeros(self.num_neurons, device=self.device)
         last_update = torch.zeros(self.num_neurons, dtype=torch.long, device=self.device)
         has_fired = torch.zeros(self.num_neurons, dtype=torch.bool, device=self.device)
-        spike_strength = torch.zeros(self.num_neurons, device=self.device)  # strength when fired
 
         output_spike_times = torch.full(
             (self.num_output,), -1, dtype=torch.long, device=self.device
         )
 
+        # GRADIENT FIX: Store pending spikes with their gradient-carrying tensors
+        # Key: delivery_time, Value: list of (neuron_indices, spike_values_with_grad)
+        pending_spikes: Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+
         # Schedule input spikes at t=0
-        # Input neurons "fire" at t=0, their output arrives at targets at t=0
         input_indices = torch.where(input_spikes)[0]
         if len(input_indices) > 0:
             wheel.schedule_batch(input_indices, fire_time=0)
             has_fired[:self.input_end] = input_spikes
-            spike_strength[:self.input_end] = input_spikes.float() * 2.0  # Initial strength
+            # Input spike values (no gradient needed for inputs, they're fixed)
+            input_vals = input_spikes.float() * 3.0
+            pending_spikes[0] = [(input_indices, input_vals[input_indices])]
 
         # Event-driven loop
         while True:
@@ -229,38 +232,45 @@ class LazyGraphSNN(nn.Module):
             if next_time is None or next_time >= max_timesteps:
                 break
 
-            # Get all neurons delivering output at this time
             t = wheel.current_time
-            spiking_neurons = wheel.advance()  # Returns tensor, advances time
+            wheel.advance()  # Clear the bucket, advance time
 
-            if len(spiking_neurons) == 0:
+            # Get pending spikes for this time (with gradients intact)
+            if t not in pending_spikes:
                 continue
 
-            # Get targets and weights for all spiking neurons
-            batch_targets = self.targets[spiking_neurons]  # [B, fan_out]
-            batch_weights = self.weights[spiking_neurons]  # [B, fan_out]
-            spike_vals = spike_strength[spiking_neurons]   # [B] - strength at time of spike
+            # Process all spike batches scheduled for this time
+            for spiking_neurons, spike_vals in pending_spikes[t]:
+                if len(spiking_neurons) == 0:
+                    continue
 
-            # Compute weighted contributions
-            contributions = spike_vals.unsqueeze(1) * batch_weights  # [B, fan_out]
+                # Get targets and weights for spiking neurons
+                batch_targets = self.targets[spiking_neurons]  # [B, fan_out]
+                batch_weights = self.weights[spiking_neurons]  # [B, fan_out]
 
-            flat_targets = batch_targets.reshape(-1)
-            flat_contribs = contributions.reshape(-1)
+                # Compute weighted contributions (gradient flows through spike_vals AND weights)
+                contributions = spike_vals.unsqueeze(1) * batch_weights  # [B, fan_out]
 
-            # Get unique target neurons receiving input
-            unique_targets = torch.unique(flat_targets)
+                flat_targets = batch_targets.reshape(-1)
+                flat_contribs = contributions.reshape(-1)
 
-            # LAZY DECAY: Apply decay only to neurons receiving input NOW
-            dt = t - last_update[unique_targets]
-            decay_factors = torch.pow(self.decay_base, dt.float())
+                # Get unique target neurons receiving input
+                unique_targets = torch.unique(flat_targets)
 
-            # Apply decay (clone for gradient safety)
-            potentials = potentials.clone()
-            potentials[unique_targets] = potentials[unique_targets] * decay_factors
-            last_update[unique_targets] = t
+                # LAZY DECAY: Apply decay only to neurons receiving input NOW
+                dt = t - last_update[unique_targets]
+                decay_factors = torch.pow(self.decay_base, dt.float())
 
-            # Accumulate contributions
-            potentials.scatter_add_(0, flat_targets, flat_contribs)
+                # Apply decay (clone for gradient safety)
+                potentials = potentials.clone()
+                potentials[unique_targets] = potentials[unique_targets] * decay_factors
+                last_update[unique_targets] = t
+
+                # Accumulate contributions
+                potentials.scatter_add_(0, flat_targets, flat_contribs)
+
+            # Clear processed spikes
+            del pending_spikes[t]
 
             # Check thresholds with surrogate gradient (only unfired neurons)
             can_spike = ~has_fired
@@ -274,9 +284,6 @@ class LazyGraphSNN(nn.Module):
                 # Record as fired
                 has_fired = has_fired | new_fired_mask
 
-                # Store spike strength for these neurons
-                spike_strength[newly_fired] = spike_probs[newly_fired]
-
                 # Record output spike times
                 for neuron in newly_fired.tolist():
                     if neuron >= self.output_start:
@@ -284,12 +291,17 @@ class LazyGraphSNN(nn.Module):
                         if output_spike_times[output_idx] < 0:
                             output_spike_times[output_idx] = t
 
-                # Schedule newly fired neurons to deliver to their targets at t + spike_delay
-                # Only schedule non-output neurons (outputs don't need to propagate further)
-                hidden_fired = newly_fired[newly_fired < self.output_start]
+                # Schedule hidden neurons with GRADIENT-CARRYING spike values
+                hidden_mask = newly_fired < self.output_start
+                hidden_fired = newly_fired[hidden_mask]
                 if len(hidden_fired) > 0:
                     delivery_time = t + self.spike_delay
                     if delivery_time < max_timesteps:
+                        # Store spike_probs[hidden_fired] which has gradient!
+                        spike_vals_with_grad = spike_probs[hidden_fired]
+                        if delivery_time not in pending_spikes:
+                            pending_spikes[delivery_time] = []
+                        pending_spikes[delivery_time].append((hidden_fired, spike_vals_with_grad))
                         wheel.schedule_batch(hidden_fired, fire_time=delivery_time)
 
                 # Soft reset for hidden neurons only (outputs accumulate for loss)
@@ -457,11 +469,11 @@ def create_lazy_two_digit_network(device: torch.device = None) -> LazyGraphSNN:
     """Create lazy graph SNN for two-digit addition."""
     return LazyGraphSNN(
         num_input=40,
-        num_hidden=128,   # Smaller for faster training
+        num_hidden=128,   # Smaller network
         num_output=22,
         fan_out=64,
         tau=20.0,
-        threshold=0.3,
+        threshold=0.2,    # Lower threshold for easier firing
         spike_delay=1,
         seed=42,
         device=device,
@@ -613,7 +625,7 @@ def create_lazy_addition_network(device: torch.device = None) -> LazyGraphSNN:
         num_output=10,
         fan_out=64,
         tau=20.0,
-        threshold=0.3,
+        threshold=0.25,  # Lower threshold
         spike_delay=1,
         seed=42,
         device=device,
@@ -694,11 +706,11 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "two":
         # Two-digit addition test
         train_lazy_two_digit(
-            num_epochs=200,
+            num_epochs=100,
             num_train=500,
             num_test=100,
             learning_rate=0.02
         )
     else:
         # Default: quick single-digit test
-        train_lazy_addition(num_epochs=50, learning_rate=0.02)
+        train_lazy_addition(num_epochs=100, learning_rate=0.02)
