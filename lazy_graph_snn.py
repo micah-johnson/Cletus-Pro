@@ -19,9 +19,10 @@ Gradient Flow:
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict, List, Optional, Set
+from typing import Tuple, Dict, List, Optional
 from dataclasses import dataclass
-import heapq
+
+from timing_wheel import TimingWheel
 
 
 class SurrogateSpike(torch.autograd.Function):
@@ -46,57 +47,6 @@ class SurrogateSpike(torch.autograd.Function):
 
 def surrogate_spike(v: torch.Tensor, threshold: float) -> torch.Tensor:
     return SurrogateSpike.apply(v, threshold)
-
-
-class EventQueue:
-    """
-    Priority queue for spike events.
-
-    Uses a min-heap to process events in time order.
-    Supports batched retrieval of all events at the same timestep.
-    """
-
-    def __init__(self):
-        self.heap: List[Tuple[int, int]] = []  # (time, neuron_id)
-        self.scheduled: Set[Tuple[int, int]] = set()  # avoid duplicates
-
-    def schedule(self, neuron_id: int, time: int):
-        """Schedule a neuron to spike at given time."""
-        key = (time, neuron_id)
-        if key not in self.scheduled:
-            heapq.heappush(self.heap, key)
-            self.scheduled.add(key)
-
-    def pop_next_batch(self) -> Tuple[int, List[int]]:
-        """
-        Pop all events at the earliest timestep.
-        Returns (time, list of neuron_ids).
-        """
-        if not self.heap:
-            return -1, []
-
-        t, first_neuron = heapq.heappop(self.heap)
-        self.scheduled.discard((t, first_neuron))
-        neurons = [first_neuron]
-
-        # Get all other neurons at same timestep
-        while self.heap and self.heap[0][0] == t:
-            _, neuron = heapq.heappop(self.heap)
-            self.scheduled.discard((t, neuron))
-            neurons.append(neuron)
-
-        return t, neurons
-
-    def has_events(self) -> bool:
-        return len(self.heap) > 0
-
-    def peek_time(self) -> int:
-        """Peek at the next event time without popping."""
-        return self.heap[0][0] if self.heap else -1
-
-    def clear(self):
-        self.heap.clear()
-        self.scheduled.clear()
 
 
 class LazyGraphSNN(nn.Module):
@@ -234,10 +184,10 @@ class LazyGraphSNN(nn.Module):
         max_timesteps: int = 50,
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        Hybrid lazy-timestep forward pass.
+        Event-driven forward pass using TimingWheel scheduler.
 
-        Uses timestep iteration (for easier gradient flow) but with lazy
-        decay computation (only update neurons when they receive input).
+        Spikes propagate with delay: neuron fires at t → targets receive at t + spike_delay.
+        Uses lazy decay: membrane only updated when input arrives.
 
         Gradient flow:
         - Input spikes -> input weights -> hidden potentials
@@ -252,38 +202,44 @@ class LazyGraphSNN(nn.Module):
             output_spike_times: [num_output] first spike time per output (-1 if none)
             info: Dictionary with output_potentials for loss computation
         """
-        # All potentials in one tensor for proper gradient flow
+        # Initialize timing wheel
+        wheel = TimingWheel(num_slots=max(256, max_timesteps * 2), device=self.device)
+
+        # State tensors
         potentials = torch.zeros(self.num_neurons, device=self.device)
         last_update = torch.zeros(self.num_neurons, dtype=torch.long, device=self.device)
         has_fired = torch.zeros(self.num_neurons, dtype=torch.bool, device=self.device)
+        spike_strength = torch.zeros(self.num_neurons, device=self.device)  # strength when fired
 
         output_spike_times = torch.full(
             (self.num_output,), -1, dtype=torch.long, device=self.device
         )
 
-        # Current spikes (soft, differentiable)
-        current_spikes = torch.zeros(self.num_neurons, device=self.device)
+        # Schedule input spikes at t=0
+        # Input neurons "fire" at t=0, their output arrives at targets at t=0
+        input_indices = torch.where(input_spikes)[0]
+        if len(input_indices) > 0:
+            wheel.schedule_batch(input_indices, fire_time=0)
+            has_fired[:self.input_end] = input_spikes
+            spike_strength[:self.input_end] = input_spikes.float() * 2.0  # Initial strength
 
-        # Initialize input spikes
-        current_spikes[:self.input_end] = input_spikes.float() * 2.0
-        has_fired[:self.input_end] = input_spikes
+        # Event-driven loop
+        while True:
+            next_time = wheel.peek_next_spike_time()
+            if next_time is None or next_time >= max_timesteps:
+                break
 
-        # Track which neurons have pending input (for lazy updates)
-        pending_input = torch.zeros(self.num_neurons, dtype=torch.bool, device=self.device)
+            # Get all neurons delivering output at this time
+            t = wheel.current_time
+            spiking_neurons = wheel.advance()  # Returns tensor, advances time
 
-        for t in range(max_timesteps):
-            # Find neurons that are spiking
-            spiking_mask = current_spikes > 0.1
+            if len(spiking_neurons) == 0:
+                continue
 
-            if not spiking_mask.any():
-                continue  # Skip timestep but don't break - allow later activity
-
-            spiking_indices = torch.where(spiking_mask)[0]
-
-            # Get all targets and weights for spiking neurons
-            batch_targets = self.targets[spiking_indices]  # [B, fan_out]
-            batch_weights = self.weights[spiking_indices]  # [B, fan_out]
-            spike_vals = current_spikes[spiking_indices]   # [B]
+            # Get targets and weights for all spiking neurons
+            batch_targets = self.targets[spiking_neurons]  # [B, fan_out]
+            batch_weights = self.weights[spiking_neurons]  # [B, fan_out]
+            spike_vals = spike_strength[spiking_neurons]   # [B] - strength at time of spike
 
             # Compute weighted contributions
             contributions = spike_vals.unsqueeze(1) * batch_weights  # [B, fan_out]
@@ -291,15 +247,14 @@ class LazyGraphSNN(nn.Module):
             flat_targets = batch_targets.reshape(-1)
             flat_contribs = contributions.reshape(-1)
 
-            # Get unique targets
+            # Get unique target neurons receiving input
             unique_targets = torch.unique(flat_targets)
 
-            # LAZY DECAY: Apply decay only to neurons receiving input
-            # dt = t - last_update[target]
+            # LAZY DECAY: Apply decay only to neurons receiving input NOW
             dt = t - last_update[unique_targets]
             decay_factors = torch.pow(self.decay_base, dt.float())
 
-            # Apply decay (creates new tensor, maintains gradient)
+            # Apply decay (clone for gradient safety)
             potentials = potentials.clone()
             potentials[unique_targets] = potentials[unique_targets] * decay_factors
             last_update[unique_targets] = t
@@ -307,36 +262,44 @@ class LazyGraphSNN(nn.Module):
             # Accumulate contributions
             potentials.scatter_add_(0, flat_targets, flat_contribs)
 
-            # Clear input spikes after first propagation
-            if t == 0:
-                current_spikes = current_spikes.clone()
-                current_spikes[:self.input_end] = 0
-
-            # Check thresholds with surrogate gradient
+            # Check thresholds with surrogate gradient (only unfired neurons)
             can_spike = ~has_fired
             spike_probs = surrogate_spike(potentials, self.threshold) * can_spike.float()
 
-            # Record new spikes
-            new_fired = spike_probs > 0.5
-            has_fired = has_fired | new_fired
+            # Find neurons that crossed threshold
+            new_fired_mask = spike_probs > 0.5
+            newly_fired = torch.where(new_fired_mask)[0]
 
-            # Record output spike times
-            output_fired = new_fired[self.output_start:self.output_end]
-            for i in range(self.num_output):
-                if output_fired[i] and output_spike_times[i] < 0:
-                    output_spike_times[i] = t
+            if len(newly_fired) > 0:
+                # Record as fired
+                has_fired = has_fired | new_fired_mask
 
-            # Soft reset for hidden neurons only (outputs accumulate for loss)
-            reset_mask = spike_probs.clone()
-            reset_mask[self.output_start:] = 0  # Don't reset outputs
-            potentials = potentials * (1 - reset_mask)
+                # Store spike strength for these neurons
+                spike_strength[newly_fired] = spike_probs[newly_fired]
 
-            # Update current spikes for next iteration
-            current_spikes = spike_probs
+                # Record output spike times
+                for neuron in newly_fired.tolist():
+                    if neuron >= self.output_start:
+                        output_idx = neuron - self.output_start
+                        if output_spike_times[output_idx] < 0:
+                            output_spike_times[output_idx] = t
+
+                # Schedule newly fired neurons to deliver to their targets at t + spike_delay
+                # Only schedule non-output neurons (outputs don't need to propagate further)
+                hidden_fired = newly_fired[newly_fired < self.output_start]
+                if len(hidden_fired) > 0:
+                    delivery_time = t + self.spike_delay
+                    if delivery_time < max_timesteps:
+                        wheel.schedule_batch(hidden_fired, fire_time=delivery_time)
+
+                # Soft reset for hidden neurons only (outputs accumulate for loss)
+                reset_mask = spike_probs.clone()
+                reset_mask[self.output_start:] = 0  # Don't reset outputs
+                potentials = potentials * (1 - reset_mask)
 
         # Final lazy decay for all neurons to end time
-        all_indices = torch.arange(self.num_neurons, device=self.device)
-        final_dt = max_timesteps - last_update
+        final_t = min(wheel.current_time, max_timesteps)
+        final_dt = final_t - last_update
         final_decay = torch.pow(self.decay_base, final_dt.float())
         potentials = potentials * final_decay
 
@@ -728,14 +691,14 @@ def train_lazy_addition(
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "single":
-        # Quick test with single-digit addition
-        train_lazy_addition(num_epochs=200, learning_rate=0.02)
-    else:
-        # Full two-digit addition test
+    if len(sys.argv) > 1 and sys.argv[1] == "two":
+        # Two-digit addition test
         train_lazy_two_digit(
-            num_epochs=300,
-            num_train=2000,
-            num_test=500,
-            learning_rate=0.015
+            num_epochs=200,
+            num_train=500,
+            num_test=100,
+            learning_rate=0.02
         )
+    else:
+        # Default: quick single-digit test
+        train_lazy_addition(num_epochs=50, learning_rate=0.02)
