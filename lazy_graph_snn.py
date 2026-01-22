@@ -494,11 +494,11 @@ def create_lazy_two_digit_network(device: torch.device = None) -> LazyGraphSNN:
     """Create lazy graph SNN for two-digit addition."""
     return LazyGraphSNN(
         num_input=40,
-        num_hidden=256,
+        num_hidden=128,   # Smaller for faster training
         num_output=22,
-        fan_out=96,      # More connections
+        fan_out=64,
         tau=20.0,
-        threshold=0.25,  # Lower threshold
+        threshold=0.3,
         spike_delay=1,
         seed=42,
         device=device,
@@ -506,11 +506,11 @@ def create_lazy_two_digit_network(device: torch.device = None) -> LazyGraphSNN:
 
 
 def train_lazy_two_digit(
-    num_epochs: int = 300,
-    num_train: int = 2000,
-    num_test: int = 500,
-    learning_rate: float = 0.03,
-    max_timesteps: int = 20,
+    num_epochs: int = 200,
+    num_train: int = 500,
+    num_test: int = 100,
+    learning_rate: float = 0.02,
+    max_timesteps: int = 15,
     device: torch.device = None,
 ):
     """Train lazy graph SNN on two-digit addition."""
@@ -566,7 +566,7 @@ def train_lazy_two_digit(
         scheduler.step()
         train_acc = correct / len(train_examples)
 
-        if (epoch + 1) % 1 == 0:
+        if (epoch + 1) % 10 == 0:
             test_correct = 0
             with torch.no_grad():
                 for ex in test_examples:
